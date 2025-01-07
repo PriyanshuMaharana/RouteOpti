@@ -1,0 +1,11 @@
+Flask
+osmnx
+networkx
+folium
+geopandas
+shapely
+requests
+numpy
+firebase-admin
+polyline
+tqdm
