@@ -1,204 +1,349 @@
-from flask import Flask, render_template, send_file, jsonify
+from firebase_admin import credentials, firestore, initialize_app
+import numpy as np
+from datetime import datetime
+from typing import List, Dict, Tuple
+import json
+import os
+from tqdm import tqdm
+import folium
 import osmnx as ox
 import networkx as nx
-import folium
-import random
-from itertools import permutations
-from shapely.geometry import Polygon, Point
-import geopandas as gpd
+from folium import plugins
+import polyline
+import math
+from haversine import haversine
+import firebase_admin
+import traceback
 
-# Flask app initialization
-app = Flask(__name__)
+class FirestoreRouteOptimizer:
+    def __init__(self, credentials_path: str):
+        """Initialize the FirestoreRouteOptimizer with Firebase credentials."""
+        try:
+            if not firebase_admin._apps:
+                cred = credentials.Certificate(credentials_path)
+                initialize_app(cred)
+            self.db = firestore.client()
+            self.graph = None
+        except Exception as e:
+            print(f"Error initializing Firebase: {e}")
+            raise
 
-# VRP Solver class (as defined in the previous code)
-class VRPSolver:
-    def __init__(self, graph, n_ants=20, evaporation_rate=0.1, alpha=1, beta=2):
-        self.graph = graph
-        self.n_ants = n_ants
-        self.evaporation_rate = evaporation_rate
-        self.alpha = alpha
-        self.beta = beta
-        self.pheromone = {}
-        self.shortest_paths = {}
-        self.shortest_distances = {}
+    def parse_coordinates(self, coord: firestore.GeoPoint) -> Tuple[float, float]:
+        """Parse a GeoPoint object into (latitude, longitude)."""
+        try:
+            lat_value = coord.latitude
+            lng_value = coord.longitude
+            return lat_value, lng_value
+        except Exception as e:
+            print(f"Error parsing coordinates: {e}")
+            raise
 
-    def precompute_distances(self, stops: List[int]):
-        """Precompute shortest paths between all stops"""
-        for start, end in permutations(stops, 2):
-            try:
-                path = nx.shortest_path(self.graph, start, end, weight='length')
-                distance = nx.shortest_path_length(self.graph, start, end, weight='length')
-                self.shortest_paths[(start, end)] = path
-                self.shortest_distances[(start, end)] = distance
-                self.pheromone[(start, end)] = 1.0
-            except nx.NetworkXNoPath:
-                continue
+    def fetch_deliveries(self, driver_id: str) -> List[Dict]:
+        """Fetch pending deliveries for a specific driver."""
+        try:
+            deliveries_ref = self.db.collection('drivers').document(driver_id).collection('deliveries')
+            query = deliveries_ref.where('status', '==', 'pending')\
+                                .order_by('priority', direction=firestore.Query.DESCENDING)
+            
+            deliveries = []
+            for doc in query.stream():
+                delivery_data = doc.to_dict()
+                delivery_data['id'] = doc.id
+                delivery_data['location'] = self.parse_coordinates(delivery_data['location'])
+                deliveries.append(delivery_data)
+            
+            return deliveries
+        except Exception as e:
+            print(f"Error fetching deliveries: {e}")
+            raise
 
-    def solve_vrp(self, depot: int, stops: List[int], max_iterations=100) -> Tuple[List[int], float]:
-        all_points = [depot] + stops
-        self.precompute_distances(all_points)
+    def ant_colony_optimization(self, distances: np.ndarray, n_ants: int = 10, n_iterations: int = 50,
+                              decay: float = 0.1, alpha: float = 1, beta: float = 2) -> List[int]:
+        """Perform Ant Colony Optimization to find the optimal route."""
+        try:
+            print("Starting Ant Colony Optimization...")
+            n_points = len(distances)
+            pheromone = np.ones((n_points, n_points)) / n_points
+            best_path = None
+            best_path_length = float('inf')
+            
+            for iteration in tqdm(range(n_iterations), desc="ACO Progress"):
+                paths = np.zeros((n_ants, n_points), dtype=int)
+                path_lengths = np.zeros(n_ants)
+                
+                for ant in range(n_ants):
+                    current = 0
+                    unvisited = list(range(1, n_points))
+                    path = [current]
+                    path_length = 0
+                    
+                    while unvisited:
+                        if np.random.random() < 0.1:
+                            next_point = np.random.choice(unvisited)
+                        else:
+                            pheromone_values = pheromone[current, unvisited]
+                            distance_values = distances[current, unvisited]
+                            
+                            with np.errstate(divide='ignore'):
+                                probabilities = (pheromone_values ** alpha) * ((1.0 / np.maximum(distance_values, 1e-10)) ** beta)
+                            
+                            probabilities = np.nan_to_num(probabilities)
+                            sum_prob = probabilities.sum()
+                            if sum_prob == 0:
+                                next_point = np.random.choice(unvisited)
+                            else:
+                                probabilities = probabilities / sum_prob
+                                next_point = unvisited[np.random.choice(len(unvisited), p=probabilities)]
+                        
+                        path_length += distances[current, next_point]
+                        current = next_point
+                        path.append(current)
+                        unvisited.remove(current)
+                    
+                    path_length += distances[current, 0]
+                    paths[ant] = path
+                    path_lengths[ant] = path_length
+                    
+                    if path_length < best_path_length:
+                        best_path_length = path_length
+                        best_path = path.copy()
+            
+                pheromone *= (1 - decay)
+                for ant in range(n_ants):
+                    for i in range(n_points - 1):
+                        current = paths[ant, i]
+                        next_point = paths[ant, i + 1]
+                        pheromone[current, next_point] += 1.0 / path_lengths[ant]
+                        pheromone[next_point, current] += 1.0 / path_lengths[ant]
+            
+            if best_path is None:
+                raise ValueError("No valid path found")
+                
+            print(f"Best path length: {best_path_length:.2f} km")
+            return best_path
+            
+        except Exception as e:
+            print(f"Error in ACO algorithm: {e}")
+            raise
 
-        best_route = None
-        best_distance = float('inf')
+    def get_shortest_path(self, origin: Tuple[float, float], destination: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """Get the shortest path between two points using OSMnx."""
+        try:
+            if self.graph is None:
+                print("Downloading street network data...")
+                self.graph = ox.graph_from_point(
+                    origin, 
+                    dist=10000,  # 10km radius
+                    network_type='drive'
+                )
+                
+            orig_node = ox.nearest_nodes(self.graph, origin[1], origin[0])
+            dest_node = ox.nearest_nodes(self.graph, destination[1], destination[0])
+            
+            route = nx.shortest_path(self.graph, orig_node, dest_node, weight='length')
+            
+            path_coords = []
+            for node in route:
+                path_coords.append((
+                    self.graph.nodes[node]['y'],
+                    self.graph.nodes[node]['x']
+                ))
+            
+            return path_coords
+        except Exception as e:
+            print(f"Error calculating shortest path: {e}")
+            return [origin, destination]
 
-        for iteration in range(max_iterations):
-            # Generate routes for each ant
-            for _ in range(self.n_ants):
-                route = self.construct_route(depot, stops)
-                if route:
-                    distance = self.calculate_total_distance(route)
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_route = route
+    def calculate_route_metrics(self, path_coords: List[Tuple[float, float]]) -> Dict:
+        """Calculate metrics for a route segment."""
+        try:
+            total_distance = 0
+            for i in range(len(path_coords) - 1):
+                total_distance += haversine(path_coords[i], path_coords[i + 1])
+            
+            # Estimate time assuming average speed of 30 km/h in urban areas
+            estimated_time = (total_distance / 30) * 60  # Convert to minutes
+            
+            return {
+                'distance_km': round(total_distance, 2),
+                'estimated_time_mins': round(estimated_time, 2)
+            }
+        except Exception as e:
+            print(f"Error calculating route metrics: {e}")
+            raise
 
-            # Update pheromones
-            self.update_pheromones(best_route, best_distance)
+    def create_route_map(self, optimal_route: Dict) -> str:
+        """Create an interactive map with the optimized delivery route."""
+        try:
+            start_location = optimal_route['start_location']
+            m = folium.Map(
+                location=start_location,
+                zoom_start=13,
+                tiles='OpenStreetMap'
+            )
 
-        return best_route, best_distance
+            # Add marker for starting point
+            folium.Marker(
+                start_location,
+                popup='Start Location',
+                icon=folium.Icon(color='green', icon='info-sign')
+            ).add_to(m)
 
-    def construct_route(self, depot: int, stops: List[int]) -> List[int]:
-        route = [depot]
-        remaining_stops = stops.copy()
+            route_group = folium.FeatureGroup(name='Delivery Route')
+            metrics_group = folium.FeatureGroup(name='Route Metrics')
 
-        while remaining_stops:
-            current = route[-1]
-            next_stop = self.select_next_stop(current, remaining_stops)
-            if next_stop is None:
-                break
-            route.append(next_stop)
-            remaining_stops.remove(next_stop)
+            # Plot each delivery point and the route between points
+            previous_point = start_location
+            total_distance = 0
+            total_time = 0
 
-        route.append(depot)  # Return to depot
-        return route
+            for idx, delivery in enumerate(optimal_route['route_sequence'], 1):
+                current_point = delivery['location']
+                
+                # Get the actual street route between points
+                path_coords = self.get_shortest_path(previous_point, current_point)
+                
+                # Calculate metrics for this segment
+                metrics = self.calculate_route_metrics(path_coords)
+                total_distance += metrics['distance_km']
+                total_time += metrics['estimated_time_mins']
 
-    def select_next_stop(self, current: int, remaining_stops: List[int]) -> int:
-        if not remaining_stops:
-            return None
+                # Draw the route line
+                route_line = folium.PolyLine(
+                    locations=path_coords,
+                    weight=3,
+                    color='blue',
+                    opacity=0.8,
+                    popup=f"Segment {idx}: {metrics['distance_km']}km, {metrics['estimated_time_mins']}min"
+                )
+                route_line.add_to(route_group)
 
-        probabilities = []
-        for stop in remaining_stops:
-            if (current, stop) not in self.shortest_distances:
-                continue
+                # Add marker for delivery point
+                folium.Marker(
+                    current_point,
+                    popup=f"""
+                    <b>Delivery {idx}</b><br>
+                    Customer: {delivery['customer_name']}<br>
+                    Address: {delivery['address']}<br>
+                    Instructions: {delivery['instructions']}<br>
+                    Contact: {delivery['contact']}<br>
+                    Priority: {delivery.get('priority', 'Normal')}<br>
+                    Distance from previous: {metrics['distance_km']}km<br>
+                    Estimated time: {metrics['estimated_time_mins']}min
+                    """,
+                    icon=folium.Icon(
+                        color='red' if delivery.get('priority', 0) > 1 else 'orange',
+                        icon='info-sign'
+                    )
+                ).add_to(route_group)
 
-            distance = self.shortest_distances[(current, stop)]
-            pheromone = self.pheromone.get((current, stop), 0.1)
+                previous_point = current_point
 
-            probability = (pheromone ** self.alpha) * ((1.0 / distance) ** self.beta)
-            probabilities.append((stop, probability))
+            # Add total metrics to the map
+            folium.Rectangle(
+                bounds=[[start_location[0] - 0.02, start_location[1] - 0.02],
+                       [start_location[0] - 0.01, start_location[1] + 0.02]],
+                color="white",
+                fill=True,
+                popup=f"""
+                <b>Total Route Metrics</b><br>
+                Total Distance: {round(total_distance, 2)}km<br>
+                Total Time: {round(total_time, 2)}min
+                """
+            ).add_to(metrics_group)
 
-        if not probabilities:
-            return None
+            route_group.add_to(m)
+            metrics_group.add_to(m)
+            folium.LayerControl().add_to(m)
 
-        total = sum(p[1] for p in probabilities)
-        if total == 0:
-            return random.choice(remaining_stops)
+            # Save the map
+            map_path = 'delivery_route.html'
+            m.save(map_path)
+            print(f"Map saved to {map_path}")
+            return map_path
 
-        r = random.random() * total
-        current_sum = 0
-        for stop, prob in probabilities:
-            current_sum += prob
-            if current_sum >= r:
-                return stop
+        except Exception as e:
+            print(f"Error creating route map: {e}")
+            traceback.print_exc()
+            raise
 
-        return probabilities[-1][0]
-
-    def calculate_total_distance(self, route: List[int]) -> float:
-        total_distance = 0
-        for i in range(len(route) - 1):
-            if (route[i], route[i+1]) not in self.shortest_distances:
-                return float('inf')
-            total_distance += self.shortest_distances[(route[i], route[i+1])]
-        return total_distance
-
-    def update_pheromones(self, best_route: List[int], best_distance: float):
-        # Evaporation
-        for start, end in self.pheromone:
-            self.pheromone[(start, end)] *= (1 - self.evaporation_rate)
-
-        # Add new pheromones
-        if best_route:
-            deposit = 1.0 / best_distance
-            for i in range(len(best_route) - 1):
-                self.pheromone[(best_route[i], best_route[i+1])] = deposit
-
-    def get_detailed_route(self, route: List[int]) -> List[int]:
-        """Convert stop-to-stop route into detailed node path"""
-        detailed_route = []
-        for i in range(len(route) - 1):
-            path = self.shortest_paths.get((route[i], route[i+1]), [])
-            detailed_route.extend(path[:-1])  # Avoid duplicating connecting nodes
-        detailed_route.append(route[-1])
-        return detailed_route
-
-# Isochrone calculation and visualization
-def generate_isochrone_map(graph, center_point, max_distance_km=100):
-    """Generate and return a folium map with the isochrone area highlighted"""
-    # Convert max_distance_km to meters
-    max_distance_m = max_distance_km * 1000
-    # Use OSMnx to generate an isochrone from the center point (depot)
-    isochrone = ox.distance.great_circle_vec(center_point[0], center_point[1], max_distance_m)
-    
-    # Create a polygon around the isochrone to highlight non-accessible areas
-    polygon = Polygon(isochrone)
-    
-    # Create a folium map centered on the depot
-    m = folium.Map(location=center_point, zoom_start=5)  # Zoom level adjusted for India
-
-    # Highlight accessible area
-    folium.GeoJson(polygon).add_to(m)
-    
-    return m
-
-@app.route("/")
-def home():
-    return render_template("index.html")
-
-@app.route("/optimize-route", methods=["GET"])
-def optimize_route():
-    try:
-        location = "India"  # Fetch OSM data for India
-        graph = ox.graph_from_place(location, network_type='drive')
-
-        largest_component = max(nx.strongly_connected_components(graph), key=len)
-        graph = graph.subgraph(largest_component).copy()
-
-        nodes = list(graph.nodes())
-        depot = random.choice(nodes)
-        stops = random.sample([n for n in nodes if n != depot], 10)
-
-        solver = VRPSolver(graph)
-        route, total_distance = solver.solve_vrp(depot, stops)
-
-        if route:
-            detailed_route = solver.get_detailed_route(route)
-            map_viz = visualize_route(graph, detailed_route, stops, depot)
-
-            # Generate the isochrone map (non-accessible areas)
-            depot_coords = (graph.nodes[depot]['y'], graph.nodes[depot]['x'])
-            isochrone_map = generate_isochrone_map(graph, depot_coords)
-
-            output_file = "optimized_delivery_route.html"
-            isochrone_map.save(output_file)
-
-            return jsonify({
-                "message": "Route optimized successfully!",
-                "route_order": route,
-                "total_distance_km": total_distance / 1000,
-                "html_file": output_file
-            })
-        else:
-            return jsonify({"message": "No valid route found", "status": "error"}), 500
-    except Exception as e:
-        return jsonify({"message": str(e), "status": "error"}), 500
-
-@app.route("/show-map")
-def show_map():
-    file_path = "optimized_delivery_route.html"
-    if os.path.exists(file_path):
-        return send_file(file_path)
-    else:
-        return "Map not generated yet. Optimize the route first by visiting /optimize-route", 404
+    def calculate_optimal_route(self, driver_id: str) -> Dict:
+        """Calculate the optimal delivery route for a driver."""
+        try:
+            deliveries = self.fetch_deliveries(driver_id)
+            if not deliveries:
+                print("No pending deliveries found.")
+                return {"error": "No pending deliveries found"}
+            
+            driver_doc = self.db.collection('drivers').document(driver_id).get()
+            if not driver_doc.exists:
+                raise ValueError(f"Driver {driver_id} not found")
+            
+            driver_data = driver_doc.to_dict()
+            if 'current_location' not in driver_data:
+                raise ValueError("Driver location not found")
+            
+            start_location = self.parse_coordinates(driver_data['current_location'])
+            points = [start_location]
+            
+            delivery_map = {}
+            for delivery in deliveries:
+                points.append(delivery['location'])
+                delivery_map[delivery['location']] = delivery
+            
+            n_points = len(points)
+            distances = np.zeros((n_points, n_points))
+            for i in range(n_points):
+                for j in range(n_points):
+                    distances[i, j] = haversine(points[i], points[j])
+            
+            route_indices = self.ant_colony_optimization(distances)
+            route_sequence = [points[idx] for idx in route_indices]
+            
+            # Build the result dictionary
+            result = {
+                "start_location": start_location,
+                "route_sequence": [
+                    {
+                        "delivery_id": delivery_map[point]['id'],
+                        "address": delivery_map[point]['address'],
+                        "location": point,
+                        "customer_name": delivery_map[point]['customer_name'],
+                        "instructions": delivery_map[point]['instructions'],
+                        "contact": delivery_map[point]['contact'],
+                        "priority": delivery_map[point].get('priority', 0)
+                    }
+                    for point in route_sequence[1:]
+                ]
+            }
+            
+            # Create and save the route map
+            map_path = self.create_route_map(result)
+            result['map_path'] = map_path
+            
+            return result
+        except Exception as e:
+            print(f"Error calculating optimal route: {e}")
+            traceback.print_exc()
+            raise
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Path to your Firebase credentials JSON file
+    FIREBASE_CREDENTIALS = "<Firebase Creds Here>"
+    DRIVER_ID = "driver_123"  # Replace with actual driver ID
 
+    try:
+        optimizer = FirestoreRouteOptimizer(credentials_path=FIREBASE_CREDENTIALS)
+
+        print("\nCalculating optimal route...")
+        optimal_route = optimizer.calculate_optimal_route(driver_id=DRIVER_ID)
+
+        if "error" in optimal_route:
+            print(f"Error: {optimal_route['error']}")
+        else:
+            print("\nOptimal Route Details:")
+            print(json.dumps(optimal_route, indent=4))
+            print(f"\nRoute map saved to: {optimal_route['map_path']}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        traceback.print_exc()
