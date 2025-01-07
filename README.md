@@ -63,3 +63,12 @@ The application includes basic error handling with informative messages for comm
 ## License
 
 This project is licensed under the MIT License
+
+## Samples
+
+**Route Optimization**
+![Route Optmization](route_optimization.jpeg)
+
+**Depots and Locations**
+![alt text](depot_and_locations.jpg)
+
